@@ -61,7 +61,7 @@ use bytes::Bytes;
 use futures::{
     future,
     prelude::*,
-    stream::{self, BoxStream},
+    stream,
     task::{Context, Poll},
 };
 
@@ -78,7 +78,7 @@ const _README: () = ();
 /// Both `Body` and `Bytes` values can be easily created from standard owned byte buffer types
 /// like `Vec<u8>` or `String`, using the `From` trait.
 pub struct Body {
-    stream: BoxStream<'static, Result<Bytes, std::io::Error>>,
+    stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + 'static>>,
 }
 
 impl Body {
@@ -90,9 +90,9 @@ impl Body {
     /// Create a body from a stream of `Bytes`
     pub fn from_stream<S>(s: S) -> Self
     where
-        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + 'static,
     {
-        Self { stream: s.boxed() }
+        Self { stream: Box::pin(s) }
     }
 
     /// Reads the stream into a new `Vec`.

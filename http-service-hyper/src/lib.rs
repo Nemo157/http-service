@@ -6,10 +6,8 @@
 #![cfg_attr(test, deny(warnings))]
 #![feature(async_await)]
 
-#[cfg(feature = "runtime")]
-use futures::compat::Future01CompatExt;
+use futures_tokio_compat::Compat;
 use futures::{
-    compat::{Compat, Compat01As03},
     future::BoxFuture,
     prelude::*,
     stream,
@@ -44,7 +42,7 @@ where
     type ResBody = hyper::Body;
     type Error = std::io::Error;
     type Service = WrapConnection<H>;
-    type Future = Compat<BoxFuture<'static, Result<Self::Service, Self::Error>>>;
+    type Future = BoxFuture<'static, Result<Self::Service, Self::Error>>;
     type MakeError = std::io::Error;
 
     fn make_service(&mut self, _ctx: Ctx) -> Self::Future {
@@ -58,7 +56,6 @@ where
             })
         }
             .boxed()
-            .compat()
     }
 }
 
@@ -69,12 +66,12 @@ where
     type ReqBody = hyper::Body;
     type ResBody = hyper::Body;
     type Error = std::io::Error;
-    type Future = Compat<BoxFuture<'static, Result<http::Response<hyper::Body>, Self::Error>>>;
+    type Future = BoxFuture<'static, Result<http::Response<hyper::Body>, Self::Error>>;
 
     fn call(&mut self, req: http::Request<hyper::Body>) -> Self::Future {
         let error = std::io::Error::from(std::io::ErrorKind::Other);
         let req = req.map(|hyper_body| {
-            let stream = Compat01As03::new(hyper_body).map(|c| match c {
+            let stream = hyper_body.map(|c| match c {
                 Ok(chunk) => Ok(chunk.into_bytes()),
                 Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
             });
@@ -84,10 +81,9 @@ where
 
         async move {
             let res: http::Response<_> = fut.into_future().await.map_err(|_| error)?;
-            Ok(res.map(|body| hyper::Body::wrap_stream(body.compat())))
+            Ok(res.map(hyper::Body::wrap_stream))
         }
             .boxed()
-            .compat()
     }
 }
 
@@ -98,13 +94,12 @@ where
 /// run by an executor.
 #[allow(clippy::type_complexity)] // single-use type with many compat layers
 pub struct Server<I: TryStream, S, Sp> {
-    inner: Compat01As03<
+    inner:
         HyperServer<
-            Compat<stream::MapOk<I, fn(I::Ok) -> Compat<I::Ok>>>,
+            stream::MapOk<I, fn(I::Ok) -> Compat<I::Ok>>,
             WrapHttpService<S>,
             Compat<Sp>,
         >,
-    >,
 }
 
 impl<I: TryStream, S, Sp> std::fmt::Debug for Server<I, S, Sp> {
@@ -116,7 +111,7 @@ impl<I: TryStream, S, Sp> std::fmt::Debug for Server<I, S, Sp> {
 /// A builder for a [`Server`].
 #[allow(clippy::type_complexity)] // single-use type with many compat layers
 pub struct Builder<I: TryStream, Sp> {
-    inner: HyperBuilder<Compat<stream::MapOk<I, fn(I::Ok) -> Compat<I::Ok>>>, Compat<Sp>>,
+    inner: HyperBuilder<stream::MapOk<I, fn(I::Ok) -> Compat<I::Ok>>, Compat<Sp>>,
 }
 
 impl<I: TryStream, Sp> std::fmt::Debug for Builder<I, Sp> {
@@ -129,7 +124,7 @@ impl<I: TryStream> Server<I, (), ()> {
     /// Starts a [`Builder`] with the provided incoming stream.
     pub fn builder(incoming: I) -> Builder<I, ()> {
         Builder {
-            inner: HyperServer::builder(Compat::new(incoming.map_ok(Compat::new as _)))
+            inner: HyperServer::builder(incoming.map_ok(Compat::new as _))
                 .executor(Compat::new(())),
         }
     }
@@ -176,12 +171,12 @@ impl<I: TryStream, Sp> Builder<I, Sp> {
         I::Ok: AsyncRead + AsyncWrite + Send + Unpin + 'static,
         I::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
         Sp: Clone + Send + 'static,
-        for<'a> &'a Sp: Spawn,
+        Sp: Spawn + Unpin,
     {
         Server {
-            inner: Compat01As03::new(self.inner.serve(WrapHttpService {
+            inner: self.inner.serve(WrapHttpService {
                 service: Arc::new(service),
-            })),
+            }),
         }
     }
 }
@@ -193,7 +188,7 @@ where
     I::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     S: HttpService,
     Sp: Clone + Send + 'static,
-    for<'a> &'a Sp: Spawn,
+    Sp: Spawn + Unpin,
 {
     type Output = hyper::Result<()>;
 
@@ -212,13 +207,5 @@ pub fn serve<S: HttpService>(
     let service = WrapHttpService {
         service: Arc::new(s),
     };
-    hyper::Server::bind(&addr).serve(service).compat()
-}
-
-/// Run the given `HttpService` at the given address on the default runtime, using `hyper` as
-/// backend.
-#[cfg(feature = "runtime")]
-pub fn run<S: HttpService>(s: S, addr: SocketAddr) {
-    let server = serve(s, addr).map(|_| Result::<_, ()>::Ok(())).compat();
-    hyper::rt::run(server);
+    hyper::Server::bind(&addr).serve(service)
 }
