@@ -15,8 +15,9 @@ version = "0.3.1"
 [dependencies]
 http = "0.1"
 http-service = { version = "0.3.1", path = ".." }
-hyper = { git = "https://github.com/hyperium/hyper", default-features = false }
+hyper = { version = "0.13.0-alpha.4", default-features = false, features = ["unstable-stream"] }
 futures-tokio-compat = { git = "https://github.com/Nemo157/futures-tokio-compat" }
+tower-service = "0.3.0-alpha.2"
 
 [dependencies.futures-preview]
 version = "0.3.0-alpha.18"

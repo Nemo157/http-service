@@ -1,11 +1,15 @@
 //! `HttpService` server that uses Hyper as backend.
 
-#![forbid(future_incompatible, rust_2018_idioms)]
-#![deny(missing_debug_implementations, nonstandard_style)]
-#![warn(missing_docs, missing_doc_code_examples)]
-#![cfg_attr(test, deny(warnings))]
+#![warn(
+    future_incompatible,
+    rust_2018_idioms,
+    missing_debug_implementations,
+    nonstandard_style,
+    missing_docs,
+    missing_doc_code_examples
+)]
 
-use futures::{future::BoxFuture, prelude::*, stream, task::Spawn};
+use futures::{future::BoxFuture, prelude::*, task::Spawn};
 use futures_tokio_compat::Compat;
 use http_service::{Body, HttpService};
 use hyper::server::{Builder as HyperBuilder, Server as HyperServer};
@@ -28,56 +32,80 @@ struct WrapConnection<H: HttpService> {
     connection: H::Connection,
 }
 
-impl<H, Ctx> hyper::service::MakeService<Ctx> for WrapHttpService<H>
+fn error_other(error: impl std::error::Error + Send + Sync + 'static) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, error)
+}
+
+impl<'a, H, Conn> tower_service::Service<&'a Conn> for WrapHttpService<H>
 where
     H: HttpService,
+    <H::ConnectionFuture as TryFuture>::Error: std::error::Error + Send + Sync + 'static,
 {
-    type ReqBody = hyper::Body;
-    type ResBody = hyper::Body;
+    type Response = WrapConnection<H>;
     type Error = std::io::Error;
-    type Service = WrapConnection<H>;
-    type Future = BoxFuture<'static, Result<Self::Service, Self::Error>>;
-    type MakeError = std::io::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn make_service(&mut self, _ctx: Ctx) -> Self::Future {
+    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: &'a Conn) -> Self::Future {
         let service = self.service.clone();
-        let error = std::io::Error::from(std::io::ErrorKind::Other);
-        async move {
-            let connection = service.connect().into_future().await.map_err(|_| error)?;
+        let connection = service.connect().into_future().map_err(error_other);
+        Box::pin(async move {
+            let connection = connection.await?;
             Ok(WrapConnection {
                 service,
                 connection,
             })
-        }
-            .boxed()
+        })
     }
 }
 
-impl<H> hyper::service::Service for WrapConnection<H>
+impl<H> tower_service::Service<hyper::Request<hyper::Body>> for WrapConnection<H>
 where
     H: HttpService,
+    <H::ResponseFuture as TryFuture>::Error: std::error::Error + Send + Sync + 'static,
 {
-    type ReqBody = hyper::Body;
-    type ResBody = hyper::Body;
+    type Response = hyper::Response<hyper::Body>;
     type Error = std::io::Error;
-    type Future = BoxFuture<'static, Result<http::Response<hyper::Body>, Self::Error>>;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn call(&mut self, req: http::Request<hyper::Body>) -> Self::Future {
-        let error = std::io::Error::from(std::io::ErrorKind::Other);
-        let req = req.map(|hyper_body| {
-            let stream = hyper_body.map(|c| match c {
-                Ok(chunk) => Ok(chunk.into_bytes()),
-                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
-            });
-            Body::from_stream(stream)
+    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: hyper::Request<hyper::Body>) -> Self::Future {
+        let req = req.map(|body| {
+            Body::from_stream(
+                body.map(|res| res.map(|chunk| chunk.into_bytes()).map_err(error_other)),
+            )
         });
-        let fut = self.service.respond(&mut self.connection, req);
+        let res = self
+            .service
+            .respond(&mut self.connection, req)
+            .into_future()
+            .map_err(error_other);
 
-        async move {
-            let res: http::Response<_> = fut.into_future().await.map_err(|_| error)?;
-            Ok(res.map(hyper::Body::wrap_stream))
-        }
-            .boxed()
+        Box::pin(async move { Ok(res.await?.map(hyper::Body::wrap_stream)) })
+    }
+}
+
+struct WrapIncoming<I> {
+    incoming: I,
+}
+
+impl<I: TryStream> hyper::server::accept::Accept for WrapIncoming<I> {
+    type Conn = Compat<I::Ok>;
+    type Error = I::Error;
+
+    fn poll_accept(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
+        unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().incoming) }
+            .try_poll_next(cx)
+            .map(|opt| opt.map(|res| res.map(Compat::new)))
     }
 }
 
@@ -88,8 +116,7 @@ where
 /// run by an executor.
 #[allow(clippy::type_complexity)] // single-use type with many compat layers
 pub struct Server<I: TryStream, S, Sp> {
-    inner:
-        HyperServer<stream::MapOk<I, fn(I::Ok) -> Compat<I::Ok>>, WrapHttpService<S>, Compat<Sp>>,
+    inner: HyperServer<WrapIncoming<I>, WrapHttpService<S>, Compat<Sp>>,
 }
 
 impl<I: TryStream, S, Sp> std::fmt::Debug for Server<I, S, Sp> {
@@ -101,7 +128,7 @@ impl<I: TryStream, S, Sp> std::fmt::Debug for Server<I, S, Sp> {
 /// A builder for a [`Server`].
 #[allow(clippy::type_complexity)] // single-use type with many compat layers
 pub struct Builder<I: TryStream, Sp> {
-    inner: HyperBuilder<stream::MapOk<I, fn(I::Ok) -> Compat<I::Ok>>, Compat<Sp>>,
+    inner: HyperBuilder<WrapIncoming<I>, Compat<Sp>>,
 }
 
 impl<I: TryStream, Sp> std::fmt::Debug for Builder<I, Sp> {
@@ -114,8 +141,7 @@ impl<I: TryStream> Server<I, (), ()> {
     /// Starts a [`Builder`] with the provided incoming stream.
     pub fn builder(incoming: I) -> Builder<I, ()> {
         Builder {
-            inner: HyperServer::builder(incoming.map_ok(Compat::new as _))
-                .executor(Compat::new(())),
+            inner: HyperServer::builder(WrapIncoming { incoming }).executor(Compat::new(())),
         }
     }
 }
@@ -133,6 +159,8 @@ impl<I: TryStream, Sp> Builder<I, Sp> {
     /// # Examples
     ///
     /// ```no_run
+    /// #![feature(never_type)]
+    ///
     /// use http_service::{Response, Body};
     /// use http_service_hyper::Server;
     /// use romio::TcpListener;
@@ -142,7 +170,7 @@ impl<I: TryStream, Sp> Builder<I, Sp> {
     ///
     /// // And an HttpService to handle each connection...
     /// let service = |req| {
-    ///     futures::future::ok::<_, ()>(Response::new(Body::from("Hello World")))
+    ///     futures::future::ok::<_, !>(Response::new(Body::from("Hello World")))
     /// };
     ///
     /// // Then bind, configure the spawner to our pool, and serve...
@@ -161,6 +189,8 @@ impl<I: TryStream, Sp> Builder<I, Sp> {
         I::Ok: AsyncRead + AsyncWrite + Send + Unpin + 'static,
         I::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
         Sp: Clone + Spawn + Unpin + Send + 'static,
+        <S::ConnectionFuture as TryFuture>::Error: std::error::Error + Send + Sync + 'static,
+        <S::ResponseFuture as TryFuture>::Error: std::error::Error + Send + Sync + 'static,
     {
         Server {
             inner: self.inner.serve(WrapHttpService {
@@ -177,6 +207,8 @@ where
     I::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     S: HttpService,
     Sp: Clone + Spawn + Unpin + Send + 'static,
+    <S::ConnectionFuture as TryFuture>::Error: std::error::Error + Send + Sync + 'static,
+    <S::ResponseFuture as TryFuture>::Error: std::error::Error + Send + Sync + 'static,
 {
     type Output = hyper::Result<()>;
 
@@ -191,7 +223,11 @@ where
 pub fn serve<S: HttpService>(
     s: S,
     addr: SocketAddr,
-) -> impl Future<Output = Result<(), hyper::Error>> {
+) -> impl Future<Output = Result<(), hyper::Error>>
+where
+    <S::ConnectionFuture as TryFuture>::Error: std::error::Error + Send + Sync + 'static,
+    <S::ResponseFuture as TryFuture>::Error: std::error::Error + Send + Sync + 'static,
+{
     let service = WrapHttpService {
         service: Arc::new(s),
     };

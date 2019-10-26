@@ -33,4 +33,4 @@ version = "0.3.0-alpha.18"
 http-service = { path = "." }
 http-service-hyper = { path = "./http-service-hyper" }
 http-service-mock = { path = "./http-service-mock" }
-tide = { git = "https://github.com/rustasync/tide", branch = "master" }
+tide = { git = "https://github.com/rustasync/tide" }
